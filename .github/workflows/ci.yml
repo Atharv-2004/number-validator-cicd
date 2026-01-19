@@ -12,6 +12,11 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    
     steps:
     # Step 1: Get our code
     - name: Checkout Code
@@ -24,7 +29,11 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
         
-    # Step 3: Cache Maven dependencies (makes builds faster)
+    # Step 3: Make Maven wrapper executable
+    - name: Make mvnw executable
+      run: chmod +x ./mvnw
+        
+    # Step 4: Cache Maven dependencies (makes builds faster)
     - name: Cache Maven packages
       uses: actions/cache@v3
       with:

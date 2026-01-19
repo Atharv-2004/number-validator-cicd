@@ -1,0 +1,139 @@
+name: CD Pipeline
+
+# When should this pipeline run?
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]  # Run after CI pipeline completes
+    types:
+      - completed
+    branches: [main, master]
+  workflow_dispatch:            # Allow manual trigger
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+    # Step 1: Get our code
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    # Step 2: Create Kubernetes deployment files
+    - name: Create Kubernetes Manifests
+      run: |
+        mkdir -p k8s
+        
+        # Create deployment.yaml
+        cat > k8s/deployment.yaml << EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: number-validator
+          labels:
+            app: number-validator
+        spec:
+          replicas: 2
+          selector:
+            matchLabels:
+              app: number-validator
+          template:
+            metadata:
+              labels:
+                app: number-validator
+            spec:
+              containers:
+              - name: number-validator
+                image: ${{ secrets.DOCKERHUB_USERNAME }}/number-validator:latest
+                ports:
+                - containerPort: 8080
+                resources:
+                  requests:
+                    memory: "256Mi"
+                    cpu: "250m"
+                  limits:
+                    memory: "512Mi"
+                    cpu: "500m"
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: number-validator-service
+        spec:
+          selector:
+            app: number-validator
+          ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 8080
+          type: LoadBalancer
+        EOF
+        
+    # Step 3: Setup kubectl (Kubernetes command line tool)
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+        
+    # Step 4: Create a local Kubernetes cluster for testing
+    - name: Setup Kind (Kubernetes in Docker)
+      uses: helm/kind-action@v1.8.0
+      with:
+        cluster_name: test-cluster
+        
+    # Step 5: Deploy to Kubernetes
+    - name: Deploy to Kubernetes
+      run: |
+        # Apply our deployment
+        kubectl apply -f k8s/deployment.yaml
+        
+        # Wait for deployment to be ready
+        kubectl wait --for=condition=available --timeout=300s deployment/number-validator
+        
+        # Check if pods are running
+        kubectl get pods -l app=number-validator
+        
+        # Get service info
+        kubectl get services
+        
+    # Step 6: Basic DAST (Dynamic Application Security Testing)
+    - name: Run Basic DAST with OWASP ZAP
+      run: |
+        # Port forward to access our service
+        kubectl port-forward service/number-validator-service 8080:80 &
+        sleep 10
+        
+        # Run OWASP ZAP baseline scan
+        docker run -t owasp/zap2docker-stable zap-baseline.py \
+          -t http://host.docker.internal:8080 \
+          -J zap-report.json || echo "DAST scan completed with findings"
+          
+    # Step 7: Validate Deployment
+    - name: Validate Deployment
+      run: |
+        # Test health endpoint
+        curl -f http://localhost:8080/health || exit 1
+        
+        # Test API functionality
+        curl -f http://localhost:8080/validate/10 | grep "even" || exit 1
+        curl -f http://localhost:8080/validate/7 | grep "odd" || exit 1
+        
+        echo "✅ Deployment validation successful!"
+        
+    # Step 8: Cleanup
+    - name: Cleanup
+      if: always()
+      run: |
+        kubectl delete -f k8s/deployment.yaml || true
